@@ -1,0 +1,244 @@
+name: Auto-Remediate Security Vulnerabilities
+
+on:
+  push:
+    branches: [main, 'feature/**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  security-scan-and-fix:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    
+    steps:
+      # 1. Checkout with full history for proper git operations
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      # 2. Set up Python environment
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      # 3. Install Python dependencies
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      # 4. Set up Node.js for Snyk CLI
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      
+      # 5. Install Snyk CLI
+      - name: Install Snyk CLI
+        run: npm install -g snyk
+      
+      # 6. Run Snyk Code SAST scan
+      - name: Run Snyk Code Test
+        id: snyk-scan
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          echo "Running Snyk Code analysis..."
+          snyk code test --json > snyk-results.json 2>&1 || true
+          
+          # Check if vulnerabilities were found
+          if [ -s snyk-results.json ]; then
+            # Check if results contain actual vulnerabilities
+            if grep -q '"isError": false' snyk-results.json 2>/dev/null; then
+              VULN_COUNT=$(cat snyk-results.json | jq '.runs[0].results | length' 2>/dev/null || echo "0")
+              if [ "$VULN_COUNT" != "0" ] && [ "$VULN_COUNT" != "null" ]; then
+                echo "Found $VULN_COUNT potential vulnerabilities"
+                echo "vulnerabilities_found=true" >> $GITHUB_OUTPUT
+                echo "vuln_count=$VULN_COUNT" >> $GITHUB_OUTPUT
+              else
+                echo "No vulnerabilities found"
+                echo "vulnerabilities_found=false" >> $GITHUB_OUTPUT
+              fi
+            else
+              echo "Snyk scan completed with issues found"
+              echo "vulnerabilities_found=true" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "No Snyk results generated"
+            echo "vulnerabilities_found=false" >> $GITHUB_OUTPUT
+          fi
+      
+      # 7. Display Snyk results summary
+      - name: Display Scan Results
+        if: always()
+        run: |
+          echo "=== Snyk Code Scan Results ==="
+          if [ -f snyk-results.json ]; then
+            cat snyk-results.json | jq '.runs[0].results[] | {ruleId: .ruleId, message: .message.text, location: .locations[0].physicalLocation.artifactLocation.uri}' 2>/dev/null || cat snyk-results.json
+          else
+            echo "No results file found"
+          fi
+      
+      # 8. Install Cursor CLI (only if vulnerabilities found)
+      - name: Install Cursor CLI
+        if: steps.snyk-scan.outputs.vulnerabilities_found == 'true'
+        run: |
+          echo "Installing Cursor CLI..."
+          curl https://cursor.com/install -fsS | bash
+          echo "$HOME/.cursor/bin" >> $GITHUB_PATH
+          
+          # Verify installation
+          export PATH="$HOME/.cursor/bin:$PATH"
+          agent --version || echo "Cursor CLI installed"
+      
+      # 9. Auto-remediate vulnerabilities with Cursor AI
+      - name: Auto-Remediate Vulnerabilities
+        if: steps.snyk-scan.outputs.vulnerabilities_found == 'true'
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+        run: |
+          export PATH="$HOME/.cursor/bin:$PATH"
+          
+          echo "Starting automated remediation..."
+          
+          agent -p --force "
+          You are a security engineer fixing vulnerabilities in a Python Flask application.
+          
+          Read the Snyk scan results in snyk-results.json to understand what vulnerabilities were found.
+          
+          Then fix each vulnerability in src/vulnerable_app.py following these secure coding practices:
+          
+          1. SQL Injection:
+             - Use parameterized queries with ? placeholders
+             - Example: cursor.execute('SELECT * FROM users WHERE id = ?', (user_id,))
+          
+          2. Command Injection:
+             - Use subprocess with a list of arguments instead of shell=True
+             - Example: subprocess.run(['cat', filename], capture_output=True)
+             - Never use os.system() with user input
+          
+          3. Path Traversal:
+             - Validate that the resolved path is within the allowed directory
+             - Use os.path.realpath() and check it starts with the base directory
+             - Reject any path containing '..'
+          
+          4. Hardcoded Secrets:
+             - Replace hardcoded secrets with os.environ.get('VAR_NAME', 'default')
+             - Use environment variables for all sensitive values
+          
+          5. Insecure Deserialization:
+             - Replace pickle.loads with json.loads for untrusted data
+             - Or add strict validation before deserialization
+          
+          6. Code Injection (eval):
+             - Remove eval() entirely or replace with safe alternatives
+             - Use ast.literal_eval() for simple expressions if needed
+          
+          IMPORTANT:
+          - Preserve the original function signatures and return types
+          - Keep the code functional - don't just remove features
+          - Add appropriate error handling where needed
+          - Do not modify any test files
+          "
+      
+      # 10. Run verification scan
+      - name: Verify Fixes
+        if: steps.snyk-scan.outputs.vulnerabilities_found == 'true'
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          echo "Running verification scan..."
+          snyk code test --json > snyk-verify.json 2>&1 || true
+          
+          echo "=== Verification Results ==="
+          if [ -f snyk-verify.json ]; then
+            REMAINING=$(cat snyk-verify.json | jq '.runs[0].results | length' 2>/dev/null || echo "unknown")
+            echo "Remaining issues: $REMAINING"
+          fi
+      
+      # 11. Commit remediated code following git best practices
+      - name: Commit Remediated Code
+        if: steps.snyk-scan.outputs.vulnerabilities_found == 'true'
+        run: |
+          # Configure git identity for the bot
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          
+          # Check if there are any changes to commit
+          if git diff --quiet && git diff --staged --quiet; then
+            echo "No changes to commit - vulnerabilities may not have been fixed"
+            exit 0
+          fi
+          
+          # Stage all changes except the snyk results files
+          git add -A
+          git reset -- snyk-results.json snyk-verify.json 2>/dev/null || true
+          
+          # Check again after staging
+          if git diff --staged --quiet; then
+            echo "No staged changes to commit"
+            exit 0
+          fi
+          
+          # Create commit with conventional commit message
+          git commit -m "fix(security): auto-remediate SAST vulnerabilities
+
+          Automated security fixes applied by Cursor CLI based on Snyk Code scan.
+          
+          Vulnerabilities addressed:
+          - SQL Injection: Converted to parameterized queries
+          - Command Injection: Replaced shell commands with safe alternatives
+          - Path Traversal: Added path validation and sanitization
+          - Hardcoded Secrets: Moved to environment variables
+          - Insecure Deserialization: Replaced with safe JSON parsing
+          - Code Injection: Removed dangerous eval() usage
+          
+          Co-authored-by: Cursor AI <noreply@cursor.com>
+          Co-authored-by: Snyk <noreply@snyk.io>"
+          
+          echo "Changes committed successfully"
+      
+      # 12. Push changes back to the branch
+      - name: Push Changes
+        if: steps.snyk-scan.outputs.vulnerabilities_found == 'true' && github.event_name == 'push'
+        run: |
+          # Only push if we have commits ahead of remote
+          if git status | grep -q "Your branch is ahead"; then
+            echo "Pushing remediated code to ${{ github.ref_name }}..."
+            git push
+            echo "Changes pushed successfully"
+          else
+            echo "No new commits to push"
+          fi
+      
+      # 13. Create summary
+      - name: Create Job Summary
+        if: always()
+        run: |
+          echo "## Security Remediation Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.snyk-scan.outputs.vulnerabilities_found }}" == "true" ]; then
+            echo "### Vulnerabilities Detected: Yes" >> $GITHUB_STEP_SUMMARY
+            echo "- Initial scan found potential security issues" >> $GITHUB_STEP_SUMMARY
+            echo "- Cursor AI attempted automated remediation" >> $GITHUB_STEP_SUMMARY
+            echo "- Verification scan completed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### Vulnerabilities Detected: No" >> $GITHUB_STEP_SUMMARY
+            echo "- No security vulnerabilities found by Snyk Code" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Workflow Details" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Triggered by:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY

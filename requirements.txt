@@ -1,0 +1,2 @@
+# Python dependencies for the vulnerable app demo
+flask>=3.0.0
