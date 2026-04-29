@@ -11,20 +11,36 @@ import ast
 import html
 import json
 import os
+import re
 import sqlite3
 import subprocess
-from flask import Flask, request, jsonify
+from urllib.parse import unquote
+
+from flask import Flask, Response, jsonify, request
 
 app = Flask(__name__)
 
-DATABASE_PASSWORD = os.environ.get("DATABASE_PASSWORD", "super_secret_password_123")
-API_KEY = os.environ.get("API_KEY", "sk-proj-1234567890abcdefghijklmnop")
-SECRET_TOKEN = os.environ.get("SECRET_TOKEN", "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+DATABASE_PASSWORD = os.environ.get("DATABASE_PASSWORD", "")
+API_KEY = os.environ.get("API_KEY", "")
+SECRET_TOKEN = os.environ.get("SECRET_TOKEN", "")
+
+# Allowlisted columns for dynamic WHERE clauses (identifiers cannot be bound as parameters in SQLite).
+_USER_FILTER_COLUMNS = frozenset({"id", "name", "email", "password"})
+
+_PING_HOST_RE = re.compile(r"^[A-Za-z0-9.\-]{1,253}$")
 
 
 def _project_root():
     """Package directory parent (repo root when layout is project/src/...)."""
     return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
+
+def _safe_cwd():
+    """Current working directory, or project root if cwd is missing (e.g. deleted temp dir)."""
+    try:
+        return os.getcwd()
+    except (FileNotFoundError, OSError):
+        return _project_root()
 
 
 def _safe_path_under(base_dir, user_path):
@@ -34,7 +50,9 @@ def _safe_path_under(base_dir, user_path):
     """
     if not user_path or user_path != user_path.strip():
         return None
-    if ".." in user_path or os.path.isabs(user_path):
+    if ".." in user_path or ".." in unquote(user_path):
+        return None
+    if os.path.isabs(user_path):
         return None
     if os.path.isabs(base_dir):
         root = os.path.abspath(base_dir)
@@ -112,12 +130,15 @@ def filter_users():
     data = request.get_json()
     column = data.get("column", "name")
     value = data.get("value", "")
-    
+
+    if column not in _USER_FILTER_COLUMNS:
+        return jsonify({"error": "Invalid column"}), 400
+
     conn = get_db_connection()
     cursor = conn.cursor()
-    
-    query = "SELECT * FROM users WHERE " + column + " = '" + value + "'"
-    cursor.execute(query)
+
+    query = "SELECT * FROM users WHERE {} = ?".format(column)
+    cursor.execute(query, (value,))
     
     users = cursor.fetchall()
     conn.close()
@@ -134,7 +155,11 @@ def execute_command():
     data = request.get_json()
     filename = data.get("filename", "")
 
-    subprocess.run(["cat", filename], capture_output=True, text=True, check=False)
+    safe_path = _safe_path_under(_safe_cwd(), filename)
+    if safe_path is None:
+        return jsonify({"error": "Invalid path"}), 400
+
+    subprocess.run(["cat", "--", safe_path], capture_output=True, text=True, check=False)
 
     return jsonify({"status": "executed"})
 
@@ -148,8 +173,12 @@ def process_file():
     data = request.get_json()
     file_path = data.get("path", "")
 
+    safe_path = _safe_path_under(_safe_cwd(), file_path)
+    if safe_path is None:
+        return jsonify({"error": "Invalid path"}), 400
+
     result = subprocess.run(
-        ["wc", "-l", file_path],
+        ["wc", "-l", "--", safe_path],
         capture_output=True,
         text=True,
         check=False,
@@ -194,7 +223,11 @@ def download_file():
     try:
         with open(safe_path, "rb") as f:
             content = f.read()
-        return content
+        return Response(
+            content,
+            mimetype="application/octet-stream",
+            headers={"X-Content-Type-Options": "nosniff"},
+        )
     except FileNotFoundError:
         return jsonify({"error": "File not found"}), 404
 
@@ -210,8 +243,8 @@ def deserialize_data():
     try:
         text = data.decode("utf-8")
         obj = json.loads(text)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        return jsonify({"error": f"Invalid JSON: {exc}"}), 400
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return jsonify({"error": "Invalid JSON"}), 400
 
     return jsonify({"type": str(type(obj)), "value": str(obj)})
 
@@ -227,8 +260,8 @@ def evaluate_expression():
 
     try:
         result = ast.literal_eval(expression)
-    except (ValueError, SyntaxError) as exc:
-        return jsonify({"error": f"Invalid expression: {exc}"}), 400
+    except (ValueError, SyntaxError):
+        return jsonify({"error": "Invalid expression"}), 400
 
     return jsonify({"result": str(result)})
 
@@ -267,8 +300,11 @@ def ping_host():
     data = request.get_json()
     host = data.get("host", "")
 
+    if not host or not _PING_HOST_RE.fullmatch(host):
+        return jsonify({"error": "Invalid host"}), 400
+
     output = subprocess.check_output(
-        ["ping", "-c", "1", host],
+        ["ping", "-c", "1", "--", host],
         text=True,
     )
 
