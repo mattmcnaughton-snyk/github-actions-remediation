@@ -103,6 +103,28 @@ def search_users():
     return jsonify([dict(u) for u in users])
 
 
+@app.route("/users/filter", methods=["POST"])
+def filter_users():
+    """
+    VULNERABILITY: SQL Injection via direct string concatenation
+    User input is directly concatenated into the SQL query without sanitization.
+    """
+    data = request.get_json()
+    column = data.get("column", "name")
+    value = data.get("value", "")
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    query = "SELECT * FROM users WHERE " + column + " = '" + value + "'"
+    cursor.execute(query)
+    
+    users = cursor.fetchall()
+    conn.close()
+    
+    return jsonify([dict(u) for u in users])
+
+
 @app.route("/execute", methods=["POST"])
 def execute_command():
     """
